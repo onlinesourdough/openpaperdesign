@@ -2,7 +2,7 @@
 name: design
 description: Create or revise a portable visual direction and selected previews or assets for a website, app, dashboard, report, slide, or content surface.
 metadata:
-  version: "1.3.0"
+  version: "1.3.1"
 ---
 
 # Design
@@ -12,7 +12,12 @@ lifecycle methods (spec, build, review, ship), if installed, for lifecycle work;
 this skill supplies design judgment.
 Stay in the current workspace. Default new working material to project-local
 `design/`; select the actual existing context, preserve owner files and reviewed
-identities, and do not migrate folders or load a collection.
+identities, and do not migrate folders or load a collection. Keep one canonical
+`DESIGN.md` at the project root. If the project already has `design.md` or another
+case variant, use that file as it is: never add a second name that differs only in
+case (case-insensitive file systems treat them as one). Choosing or opening a
+project or canvas is read-only; it never rewrites the direction, generates
+boilerplate or moves canonical files.
 
 Read the selected brief, canonical `DESIGN.md`, and relevant prior decisions.
 Reuse the accepted outcome, audience/job, primary action or decision, surfaces,
@@ -67,4 +72,4 @@ the [read-only audit](../review-design/references/audit.md).
 (onlinesourdough/AIOS-plugin `a14f2857d8e229e7d3ce2c9beb15b876094e6d85`, v0.28.1), MIT
 License, Copyright (c) 2026 onlinesourdough; see [LICENSE](LICENSE) and
 [NOTICE](../../NOTICE.md). Changes: host-neutral wording, the OpenPencil adapter replaced by
-the openpaperdesign editor.*
+the openpaperdesign editor; 1.3.1 adds the root `DESIGN.md` case rule and read-only opening.*

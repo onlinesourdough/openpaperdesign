@@ -65,3 +65,16 @@ pub fn hit(dir: &Path, point: &'static str) {
         }
     }
 }
+
+/// A one-shot injected failure: true (and the arming `Point` sees it reached) only when a test
+/// armed `point` for `dir`.
+pub fn fault(dir: &Path, point: &'static str) -> bool {
+    let hook = hooks().lock().unwrap().remove(&(dir.to_path_buf(), point));
+    match hook {
+        Some((reached, _)) => {
+            let _ = reached.send(());
+            true
+        }
+        None => false,
+    }
+}

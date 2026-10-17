@@ -152,7 +152,7 @@ fn strict_absolute_path(s: &str) -> Result<PathBuf, String> {
 
 /// Only local UTF-8 file URIs: empty authority or literal localhost. Decode once,
 /// strictly; never accept remote hosts, query/fragment, encoded separators or NUL.
-fn file_uri(uri: &str) -> Result<PathBuf, String> {
+pub(super) fn file_uri(uri: &str) -> Result<PathBuf, String> {
     let path = uri
         .strip_prefix("file://")
         .and_then(|p| {

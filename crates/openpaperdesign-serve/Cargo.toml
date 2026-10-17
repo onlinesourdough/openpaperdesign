@@ -23,7 +23,8 @@ path = "src/lib.rs"
 [dependencies]
 paper-rs = { path = "../.." }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-std"] }
+# process + io-util: the sidebar home's read-only native project inventory (`codex app-server`).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-std", "io-util", "process"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 getrandom = "0.3"
 # Same requirements and features as the root package (MCP server over streamable HTTP).
@@ -31,6 +32,9 @@ rmcp = { version = "3.5.1", default-features = false, features = ["server", "bas
 # The XML parser usvg uses: inline SVG is checked with the same parser before it reaches usvg.
 roxmltree = "0.21"
 tower = "0.5"
+# Same requirement and features as the root package: the app library decodes the images of an
+# imported or exported canvas file without registering them in upstream's process-wide registry.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

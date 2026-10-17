@@ -16,15 +16,24 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tower::ServiceExt as _;
 
 // A complete name list lets open_editor exercise its real lifecycle without requiring a
-// web build for cargo test. These inert bytes are not browser-rendering evidence.
+// web build for cargo test. These inert bytes are not browser-rendering evidence: the in-panel
+// module parts are one-line stand-ins (enough for the launcher to assemble and serve a module,
+// nothing that renders), and the "wasm" is 600,000 filler bytes that only exercise the bounded
+// part transfer (three parts).
 pub(super) static BUNDLE_FILES: crate::EmbeddedBundle = &[
     ("index.html", b"test fixture"),
     ("app.js", b""),
-    ("page.js", b""),
-    ("session.js", b""),
-    ("openpaperdesign_web.js", b""),
-    ("openpaperdesign_web_bg.wasm", b""),
+    ("page.js", b"export function frameStep() {}"),
+    ("session.js", b"export class Session {}"),
+    ("editor.js", b"export function opdMountEditor() {}"),
+    (
+        "panel.js",
+        b"export function opdCreatePanel() { return null; }",
+    ),
+    ("openpaperdesign_web.js", b"export function start() {}"),
+    ("openpaperdesign_web_bg.wasm", &FIXTURE_WASM),
 ];
+pub(super) static FIXTURE_WASM: [u8; 600_000] = [0x61; 600_000];
 
 type Listeners = HashMap<u16, UnboundedSender<DuplexStream>>;
 fn listeners() -> &'static Mutex<Listeners> {
@@ -94,7 +103,7 @@ async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 #[path = "../tests/support/codex_context.rs"]
-mod context;
+pub(super) mod context;
 struct Client {
     peer: rmcp::service::RunningService<rmcp::RoleClient, ()>,
     meta: RequestMetaObject,
@@ -852,3 +861,318 @@ async fn lifecycle_cancelled_bind_waiter_still_completes_handoff() {
     assert_eq!(width(&f.c, &f.frame).await, 0.0);
     f.finish().await;
 }
+
+// ---- direct (home view) origin: authority lifetime ----
+
+impl Fixture {
+    /// X bound by a direct view action (`openpaperdesign_ui_open`) in a fresh packaged session:
+    /// no model call ever admitted it. Page reads and the frame go through the editor's own
+    /// HTTP MCP session, so no launcher admission (model or view) happens after the bind.
+    async fn direct() -> Self {
+        use std::hash::{BuildHasher, RandomState};
+        let ws = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "opd-direct-life-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (x, _) = paper_rs::project::Store::open(ws.join("design"))
+            .unwrap()
+            .create("X")
+            .unwrap();
+        let page = x.manifest.pages[0].id.clone();
+        let l = Launcher::new(None);
+        let (c, task) = connect_launcher(l.clone(), context::writable(&ws)).await;
+        let opened = value(
+            call(
+                &c,
+                "openpaperdesign_ui_open",
+                json!({"project": "design/X"}),
+            )
+            .await,
+        );
+        assert_eq!(opened["action"], "opened");
+        let (port, token) = opened["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:")
+            .unwrap()
+            .split_once("/#token=")
+            .unwrap();
+        let (port, token) = (port.parse().unwrap(), token.to_string());
+        let old = {
+            let st = l.state.lock().await;
+            let b = st.bound.as_ref().unwrap();
+            assert_eq!(b.owner, Owner::Direct);
+            assert_eq!(st.pinned_by, Owner::Direct);
+            b.server.clone()
+        };
+        let mut f = Self {
+            ws,
+            l,
+            c,
+            task,
+            x,
+            page,
+            frame: String::new(),
+            port,
+            token,
+            old,
+        };
+        let sid = http_session(&f, true).await;
+        let frame = http_call(f.port, &f.token, &sid, "create_artboard", json!({"name": "Frame", "styles": {"display": "flex", "flexDirection": "column", "width": "300px", "height": "200px"}})).await;
+        f.frame = value(frame)["id"].as_str().unwrap().to_string();
+        f
+    }
+}
+
+async fn status_of(l: &Launcher) -> (Option<String>, bool) {
+    let st = l.state.lock().await;
+    (st.invalidated.clone(), st.bound.is_some())
+}
+
+/// A downgrade a view call observes for a binding the view installed retires it: the started
+/// HTTP write finishes, the queued MCP write and browser save are refused, and late HTTP and
+/// stdio handles stay fenced. Nothing saves after retirement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_downgrade_drains_writers_and_fences_browser_and_stdio() {
+    let f = Fixture::direct().await;
+    let sid = http_session(&f, true).await;
+    let before = f.bytes();
+    let mut snapshot = Point::arm(&f.x.dir, "snapshot", true);
+    let (port, token) = (f.port, f.token.clone());
+    let (sid2, args) = (sid.clone(), insertion(&f.frame));
+    let running =
+        tokio::spawn(async move { http_call(port, &token, &sid2, "write_html", args).await });
+    snapshot.reached().await;
+    let mut queued_point = Point::arm(&f.x.dir, "queued", false);
+    let (token, args) = (f.token.clone(), insertion(&f.frame));
+    let queued =
+        tokio::spawn(async move { http_call(port, &token, &sid, "write_html", args).await });
+    queued_point.reached().await;
+    let mut browser_point = Point::arm(&f.x.dir, "browser_queued", false);
+    let token = f.token.clone();
+    let page_path = format!("/api/pages/{}", f.page);
+    let body = std::str::from_utf8(&before.0).unwrap().to_owned();
+    let extra = format!("If-Match: {}\r\n", crate::etag(&before.0));
+    let browser =
+        tokio::spawn(async move { http(port, &token, "PUT", &page_path, &extra, &body).await });
+    browser_point.reached().await;
+    // The same workspace, its write grant gone: observed by the view's own call.
+    let c = f.c.clone();
+    let revoked = context::readonly(&f.ws);
+    let downgrade = tokio::spawn(async move {
+        call_meta(&c, "openpaperdesign_ui_canvases", json!({}), revoked).await
+    });
+    bounded(f.old.lifecycle.retiring.notified()).await;
+    assert!(
+        !downgrade.is_finished(),
+        "retirement waits for the started write"
+    );
+    assert_eq!(f.bytes(), before, "paused write has not saved");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    let after_started = f.bytes();
+    assert_ne!(
+        after_started, before,
+        "the started write completed before retirement"
+    );
+    assert!(
+        bounded(queued)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("retired")
+    );
+    assert_eq!(bounded(browser).await.unwrap().0, 503);
+    let refusal = bounded(downgrade).await.unwrap().unwrap_err();
+    assert!(refusal.contains("canvas was closed"), "{refusal}");
+    let (invalidated, bound) = status_of(&f.l).await;
+    assert!(
+        invalidated.is_some() && !bound,
+        "admission closed, binding dropped"
+    );
+    // Late handles: a retained router (an already accepted connection) and the stdio session.
+    let response = router(f.old.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/pages/{}", f.page))
+                .header("Host", format!("127.0.0.1:{}", f.port))
+                .header("Authorization", format!("Bearer {}", f.token))
+                .header("If-Match", crate::etag(&after_started.0))
+                .body(Body::from(after_started.0.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        f.old
+            .call_tool(f.l.session, "write_html", insertion(&f.frame))
+            .await
+            .unwrap_err()
+            .contains("retired")
+    );
+    // Nothing revives it: a valid view call and a valid model call are both refused.
+    assert!(
+        call(&f.c, "openpaperdesign_ui_canvases", json!({}))
+            .await
+            .unwrap_err()
+            .contains("retired")
+    );
+    assert!(
+        call(&f.c, "create_project", json!({"name": "Late"}))
+            .await
+            .is_err()
+    );
+    assert!(!f.ws.join("design/Late").exists());
+    assert_eq!(f.bytes(), after_started, "nothing saved after retirement");
+}
+
+/// The workspace replaced under a view-installed binding (same path, new identity) is an
+/// observed identity loss: retired, and the browser endpoint fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_identity_loss_retires_its_binding() {
+    let f = Fixture::direct().await;
+    let moved = f.ws.with_extension("moved");
+    std::fs::rename(&f.ws, &moved).unwrap();
+    std::fs::create_dir(&f.ws).unwrap();
+    let refusal = call(&f.c, "openpaperdesign_ui_editor", json!({}))
+        .await
+        .unwrap_err();
+    assert!(refusal.contains("canvas was closed"), "{refusal}");
+    assert!(!status_of(&f.l).await.1, "binding dropped");
+    assert!(status_of(&f.l).await.0.is_some());
+    let page = std::fs::read(
+        moved
+            .join("design/X/pages")
+            .join(format!("{}.json", f.page)),
+    )
+    .unwrap();
+    // The listener is gone; a retained router (an already accepted connection) is fenced.
+    let response = router(f.old.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/pages/{}", f.page))
+                .header("Host", format!("127.0.0.1:{}", f.port))
+                .header("Authorization", format!("Bearer {}", f.token))
+                .header("If-Match", crate::etag(&page))
+                .body(Body::from(page.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = std::fs::remove_dir_all(&moved);
+}
+
+/// A view-call retirement owned by its spawned task survives cancelling the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_retirement_survives_cancellation_and_never_revives() {
+    let f = Fixture::direct().await;
+    let sid = http_session(&f, true).await;
+    let mut snapshot = Point::arm(&f.x.dir, "snapshot", true);
+    let (port, token, args) = (f.port, f.token.clone(), insertion(&f.frame));
+    let running =
+        tokio::spawn(async move { http_call(port, &token, &sid, "write_html", args).await });
+    snapshot.reached().await;
+    let l = f.l.clone();
+    let revoked = context::readonly(&f.ws);
+    let retire = tokio::spawn(async move {
+        l.direct("openpaperdesign_ui_canvases", json!({}), &revoked)
+            .await
+    });
+    bounded(f.old.lifecycle.retiring.notified()).await;
+    retire.abort();
+    assert!(retire.await.unwrap_err().is_cancelled());
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    let (invalidated, bound) = status_of(&f.l).await;
+    assert!(invalidated.is_some() && !bound);
+    let before = f.bytes();
+    assert!(
+        f.old
+            .call_tool(f.l.session, "write_html", insertion(&f.frame))
+            .await
+            .is_err()
+    );
+    assert!(
+        call(&f.c, "openpaperdesign_ui_create", json!({"name": "Late"}))
+            .await
+            .is_err()
+    );
+    assert!(!f.ws.join("design/Late").exists());
+    assert_eq!(f.bytes(), before);
+}
+
+/// Controls: a view call without the host's context observes nothing, and no view call
+/// retires a binding a model call installed, even with a downgraded or malformed context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_calls_never_retire_without_context_or_a_model_binding() {
+    // View-installed binding, view call without context: refused, still bound and writable.
+    let f = Fixture::direct().await;
+    let app: RequestMetaObject = json!({"thread_id": "t", "threadId": "t"})
+        .as_object()
+        .unwrap()
+        .clone()
+        .into();
+    let refusal = call_meta(&f.c, "openpaperdesign_ui_canvases", json!({}), app.clone())
+        .await
+        .unwrap_err();
+    assert!(refusal.contains("no Codex workspace context"), "{refusal}");
+    assert_eq!(status_of(&f.l).await, (None, true));
+    assert_eq!(
+        http(f.port, &f.token, "GET", "/api/project", "", "")
+            .await
+            .0,
+        200
+    );
+    f.finish().await;
+
+    // Model-installed binding: downgraded, malformed and other-workspace view calls refuse only.
+    let m = Fixture::with_context(true).await;
+    let mut malformed = context::writable(&m.ws);
+    malformed.get_mut(context::KEY).unwrap()["sandboxCwd"] = json!(12);
+    let other = m.ws.join("design");
+    for meta in [
+        context::readonly(&m.ws),
+        malformed,
+        context::writable(&other),
+        app,
+    ] {
+        assert!(
+            call_meta(&m.c, "openpaperdesign_ui_canvases", json!({}), meta)
+                .await
+                .is_err()
+        );
+        assert_eq!(status_of(&m.l).await, (None, true));
+    }
+    {
+        let st = m.l.state.lock().await;
+        assert_eq!(st.bound.as_ref().unwrap().owner, Owner::Model);
+        assert!(Arc::ptr_eq(&st.bound.as_ref().unwrap().server, &m.old));
+    }
+    assert_eq!(
+        http(m.port, &m.token, "GET", "/api/project", "", "")
+            .await
+            .0,
+        200
+    );
+    // The model's own downgrade still retires it (unchanged).
+    assert!(
+        call_meta(
+            &m.c,
+            "openpaperdesign_status",
+            json!({}),
+            context::readonly(&m.ws)
+        )
+        .await
+        .is_ok()
+    );
+    assert!(status_of(&m.l).await.0.is_some());
+}
+
+// ---- the app library (`--app-library`) ----
+
+#[path = "launcher_app_tests.rs"]
+mod app_library;

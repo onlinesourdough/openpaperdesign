@@ -2,7 +2,11 @@
 //!
 //! - Serves the built `openpaperdesign-web` bundle and a small JSON API.
 //! - API calls need the per-launch token (`Authorization: Bearer …`); requests with a foreign
-//!   `Host` (DNS rebinding) or a cross-origin `Origin`/`Sec-Fetch-Site` are refused.
+//!   `Host` (DNS rebinding) or a cross-origin `Origin`/`Sec-Fetch-Site` are refused. One
+//!   exception: a top-level document navigation to `/` from another site (a link or redirect,
+//!   such as the host opening the editor URL) gets the static bootstrap page, which holds no
+//!   project data. The editor's capability stays in the URL fragment, never sent over HTTP; the
+//!   page's own API and MCP calls still need it as the Bearer token (see `top_level_entry`).
 //! - Pages are addressed by the ids listed in the project's manifest only; the server builds
 //!   every path itself, so no client input reaches the file system as a path.
 //! - Symbolic links are refused, fail closed: `project.json`, `pages/`, every page file and
@@ -14,7 +18,7 @@
 //!   rename over the page file, so a write never lands outside `pages/`. Residual race: a
 //!   directory or link swapped in between a check and the following file operation can still
 //!   redirect that read or write.
-//! - The web bundle (six allowlisted files) is checked and read into memory once at startup,
+//! - The web bundle (eight allowlisted files) is checked and read into memory once at startup,
 //!   from a folder outside the project; static requests never touch the file system.
 //! - Unix only (Linux, macOS): the root identity and hard-link checks use Unix metadata, so the
 //!   server refuses to start elsewhere.
@@ -34,6 +38,7 @@ pub mod agent;
 mod commit;
 #[doc(hidden)]
 pub mod launcher;
+pub(crate) mod library;
 mod lifecycle;
 #[cfg(test)]
 mod test_support;
@@ -59,11 +64,15 @@ pub(crate) const ASSETS: &str = ASSETS_DIR;
 /// The MCP endpoint (same listener, same token).
 pub const MCP_PATH: &str = "/mcp";
 
-/// Files of the web bundle, by URL path. Nothing else is served from disk.
+/// Files of the web bundle, by URL path. Nothing else is served from disk. `panel.js` is the
+/// in-panel editor's own part; the launcher inlines it (with the glue, `session.js`, `page.js`
+/// and `editor.js`) into the home view, and serving it here gives the browser nothing new.
 const BUNDLE: &[(&str, &str, &str)] = &[
     ("/", "index.html", "text/html; charset=utf-8"),
     ("/app.js", "app.js", "text/javascript; charset=utf-8"),
     ("/page.js", "page.js", "text/javascript; charset=utf-8"),
+    ("/editor.js", "editor.js", "text/javascript; charset=utf-8"),
+    ("/panel.js", "panel.js", "text/javascript; charset=utf-8"),
     (
         "/session.js",
         "session.js",
@@ -89,7 +98,20 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
 
 /// Revision of a page whose file does not exist yet (listed in the manifest, never saved).
 pub const ABSENT: &str = "\"absent\"";
-const MAX_PAGE_BYTES: usize = 64 << 20;
+pub(crate) const MAX_PAGE_BYTES: usize = 64 << 20;
+
+/// An extra identity check run before every read and write of a bound project, from the
+/// browser API and the MCP host alike (the app library's root and lease, see `library`). Once
+/// it fails it keeps failing.
+pub(crate) type Guard = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// What the browser editor reported to this server: that it loaded the page and its renderer
+/// is Ready, and how many of its saves were committed. Never the URL or anything else.
+#[derive(Default)]
+pub(crate) struct EditorState {
+    ready: std::sync::atomic::AtomicBool,
+    saves: std::sync::atomic::AtomicU64,
+}
 
 pub struct Config {
     /// The project folder (must contain an upstream `project.json`).
@@ -121,6 +143,9 @@ pub struct Server {
     broken: Broken,
     /// Every page id the host has held, released only after retirement drains its writers.
     held: HeldPages,
+    /// The app library's identity check for this project, if it is a library canvas.
+    guard: Option<Guard>,
+    editor: EditorState,
 }
 
 /// Fully loaded but not yet active. Preparation has no effect on the layout registry.
@@ -210,7 +235,7 @@ pub(crate) fn plain(path: &Path, want: Kind) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn links(m: &std::fs::Metadata) -> u64 {
+pub(crate) fn links(m: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     m.nlink()
 }
@@ -223,7 +248,7 @@ pub(crate) fn dev_ino(m: &std::fs::Metadata) -> (u64, u64) {
 
 // Non-Unix: `Server::open` refuses to start, so these never run; they fail closed anyway.
 #[cfg(not(unix))]
-fn links(_m: &std::fs::Metadata) -> u64 {
+pub(crate) fn links(_m: &std::fs::Metadata) -> u64 {
     u64::MAX
 }
 
@@ -391,6 +416,7 @@ impl Server {
             BundleSource::Dir(cfg.web_dir),
             cfg.port,
             cfg.token,
+            None,
         )
         .map(PreparedServer::activate)
     }
@@ -425,7 +451,31 @@ impl Server {
             "only supported on Unix (Linux, macOS)".into(),
         ));
         #[cfg(unix)]
-        Self::open_unix(project, BundleSource::Embedded(files), port, token)
+        Self::open_unix(project, BundleSource::Embedded(files), port, token, None)
+    }
+
+    /// Like [`Server::prepare_embedded`], for an app-library canvas: `guard` (its library and
+    /// lease check, see `library::guard`) runs before upstream `Project::open` and then before
+    /// every browser and MCP read and write.
+    pub(crate) fn prepare_library(
+        project: PathBuf,
+        files: EmbeddedBundle,
+        port: u16,
+        token: String,
+        guard: Guard,
+    ) -> Result<PreparedServer, OpenError> {
+        #[cfg(not(unix))]
+        return Err(OpenError::Unsafe(
+            "only supported on Unix (Linux, macOS)".into(),
+        ));
+        #[cfg(unix)]
+        Self::open_unix(
+            project,
+            BundleSource::Embedded(files),
+            port,
+            token,
+            Some(guard),
+        )
     }
 
     #[cfg(unix)]
@@ -434,7 +484,11 @@ impl Server {
         bundle: BundleSource,
         port: u16,
         token: String,
+        guard: Option<Guard>,
     ) -> Result<PreparedServer, OpenError> {
+        if let Some(g) = &guard {
+            g().map_err(OpenError::Unsafe)?;
+        }
         let dir = project
             .canonicalize()
             .map_err(|e| OpenError::NotAProject(project.clone(), e.to_string()))?;
@@ -461,12 +515,13 @@ impl Server {
         let lifecycle = Arc::new(lifecycle::Lifecycle::default());
         let broken = Broken::default();
         let held = HeldPages::default();
-        let calls = agent::spawn_host(
+        let calls = agent::spawn_host_guarded(
             dir.clone(),
             root_id,
             lifecycle.clone(),
             broken.clone(),
             held.clone(),
+            guard.clone(),
         )
         .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = port;
@@ -484,6 +539,8 @@ impl Server {
             calls,
             broken,
             held,
+            guard,
+            editor: EditorState::default(),
         })))
     }
 
@@ -516,10 +573,50 @@ impl Server {
         self.bundle.len()
     }
 
-    /// Root identity plus the project's own entries; run before every read and write.
+    /// The bound project's manifest, behind the same boundary as every API read: the root is
+    /// still the directory that was bound (a real directory with the same canonical path and
+    /// device/inode, so a replaced or linked root is refused) and its own entries are real.
+    /// Reading it acknowledges no page.
+    pub(crate) fn bound_manifest(&self) -> Result<Manifest, String> {
+        check_root(&self.dir, self.root_id)?;
+        self.check_guard()?;
+        check_project_dir(&self.dir)?;
+        read_manifest_checked(&self.dir)
+    }
+
+    fn check_guard(&self) -> Result<(), String> {
+        self.guard.as_ref().map_or(Ok(()), |g| g())
+    }
+
+    /// Root identity, the library guard (for a library canvas) and the project's own entries;
+    /// run before every read and write.
     fn check(&self) -> Result<(), ApiError> {
         check_root(&self.dir, self.root_id).map_err(forbidden)?;
+        self.check_guard().map_err(forbidden)?;
         check_project_dir(&self.dir).map_err(forbidden)
+    }
+
+    /// Whether the browser editor reported its page loaded and Ready, and how many browser
+    /// saves were committed. A navigation request never sets these.
+    pub(crate) fn editor_state(&self) -> (bool, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.editor.ready.load(Ordering::Acquire),
+            self.editor.saves.load(Ordering::Acquire),
+        )
+    }
+
+    /// The saved canvas as a portable file (`library::payload`): one coherent snapshot of the
+    /// files on disk, read under this binding's writer fence, so no browser or MCP save is
+    /// half-written in it (it waits for one under way). Edits still only in a browser tab are
+    /// not on disk and not in it. The fence is released before the text is handed on.
+    pub(crate) async fn saved_snapshot(&self) -> Result<library::payload::Exported, String> {
+        let _write = self.lifecycle.write.lock().await;
+        self.lifecycle.check_active()?;
+        check_root(&self.dir, self.root_id)?;
+        self.check_guard()?;
+        check_project_dir(&self.dir)?;
+        library::payload::export(&self.dir)
     }
 
     fn project(&self) -> Result<Project, ApiError> {
@@ -554,8 +651,9 @@ fn error(status: StatusCode, msg: &str) -> Response {
     ApiError::new(status, msg).into_response()
 }
 
-/// An API failure: status, message and (for 409) the page's current revision.
-struct ApiError {
+/// An API failure: status, message and (for 409) the page's current revision. The in-panel
+/// page tools (`launcher_app.rs`) report the same three.
+pub(crate) struct ApiError {
     status: StatusCode,
     msg: String,
     etag: Option<String>,
@@ -595,6 +693,27 @@ fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The one request from another site that is let through: the browser's top-level navigation
+/// to the editor page itself, as when a link or redirect on the host's own site (its open-link)
+/// opens the editor URL. Only `GET /`, marked by the browser as a navigation
+/// (`Sec-Fetch-Mode: navigate`) of a top-level document (`Sec-Fetch-Dest: document`) from a
+/// same-site or cross-site page. It returns the static bootstrap page only: no project data,
+/// file operation or state. The editor's capability is the URL fragment (`#token=…`), which the
+/// browser never sends, so nothing here checks or needs it; every API and MCP call still needs
+/// it as a Bearer token from the page's own origin. Frames, fetches, subresources, other paths
+/// and methods stay refused, and a foreign `Origin` or `Host` is refused before this.
+fn top_level_entry(req: &Request) -> bool {
+    let h = req.headers();
+    req.method() == axum::http::Method::GET
+        && req.uri().path() == "/"
+        && header_str(h, "sec-fetch-mode") == Some("navigate")
+        && header_str(h, "sec-fetch-dest") == Some("document")
+        && matches!(
+            header_str(h, "sec-fetch-site"),
+            Some("same-site" | "cross-site")
+        )
+}
+
 /// Host / Origin / fetch-site checks for every request, token check for `/api/`.
 async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let h = req.headers();
@@ -609,6 +728,7 @@ async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Respon
     }
     if let Some(site) = header_str(h, "sec-fetch-site")
         && !matches!(site, "same-origin" | "none")
+        && !top_level_entry(&req)
     {
         return error(StatusCode::FORBIDDEN, "cross-site request");
     }
@@ -675,6 +795,7 @@ pub fn router(s: Arc<Server>) -> Router {
         .route("/api/project", get(get_project))
         .route("/api/pages/{id}", get(get_page).put(put_page))
         .route("/api/pages/{id}/revision", get(get_revision))
+        .route("/api/ready", axum::routing::post(post_ready))
         .nest_service(
             MCP_PATH,
             tower::ServiceBuilder::new()
@@ -720,6 +841,240 @@ async fn get_project(State(s): State<Arc<Server>>) -> Response {
         .into_response()
 }
 
+/// The browser editor's own report that it loaded its page and its renderer is Ready (token
+/// and origin checked like every API call). It carries nothing and changes no file.
+async fn post_ready(State(s): State<Arc<Server>>) -> Response {
+    match s.mark_ready() {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// How long a save may wait for the writer fence before it is given up, unrun (as for MCP
+/// calls, see `agent`).
+const SAVE_START: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One page as a reader gets it: its manifest identity, the canvas name, its revision and its
+/// file bytes (a listed page without a file reads as upstream's empty page).
+pub(crate) struct PageRead {
+    pub id: String,
+    pub name: String,
+    pub project: String,
+    pub revision: String,
+    pub bytes: Vec<u8>,
+}
+
+/// The page operations shared by the browser's HTTP API and the app's in-panel page tools
+/// (`launcher_app.rs`). Each one checks admission (an active binding) itself, so no caller
+/// relies on the HTTP middleware for it; the page reads and the save also check the root
+/// identity, the library guard and the project's own entries. `mark_ready` reads and writes no
+/// file and checks only admission (the in-panel caller re-checks the canvas, library and lease
+/// first). HTTP keeps its own Host/Origin/token checks in front of these.
+impl Server {
+    fn admit(&self) -> Result<(), ApiError> {
+        self.lifecycle
+            .check_active()
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))
+    }
+
+    /// Page `id` of the manifest, or with `None` the manifest's active page (its first page
+    /// when none is set or the set one isn't listed), as the browser editor picks it.
+    pub(crate) fn page(&self, id: Option<&str>) -> Result<PageRead, ApiError> {
+        self.admit()?;
+        let p = self.project()?;
+        let id = match id {
+            Some(id) => id.to_string(),
+            None => p
+                .manifest
+                .active_page
+                .clone()
+                .filter(|a| p.manifest.pages.iter().any(|r| &r.id == a))
+                .or_else(|| p.manifest.pages.first().map(|r| r.id.clone()))
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "this canvas has no pages"))?,
+        };
+        let name = page_ref(&p, &id)?;
+        let bytes = read_page(&p, &id)?;
+        let rev = revision(&bytes);
+        let bytes = match bytes {
+            Some(b) => b,
+            // Same as upstream `Project::load_pages`: a listed page without a file is empty.
+            None => page_to_json(&PageData {
+                id: id.clone(),
+                name: name.clone(),
+                doc: Document {
+                    name: name.clone(),
+                    ..Default::default()
+                },
+                camera: None,
+            })
+            .into_bytes(),
+        };
+        Ok(PageRead {
+            id,
+            name,
+            project: p.manifest.name.clone(),
+            revision: rev,
+            bytes,
+        })
+    }
+
+    /// The current revision of page `id` (cheap polling).
+    pub(crate) fn page_revision(&self, id: &str) -> Result<String, ApiError> {
+        self.admit()?;
+        let p = self.project()?;
+        page_ref(&p, id)?;
+        Ok(revision(&read_page(&p, id)?))
+    }
+
+    /// Save page `id` from `body` (an upstream page file), only if `if_match` is its revision
+    /// on disk now. The one save transaction of every browser and in-panel save: the page and
+    /// the manifest (its `modified` time only; the page list, names, order, active page, other
+    /// pages and assets as they are on disk now) are one commit, rolled back on any error. A
+    /// failed rollback fences every later write (`Broken`). The wait for the writer fence is
+    /// bounded (`SAVE_START`): a save that couldn't start, or whose caller stopped waiting
+    /// before it started, never runs. Once it holds the fence nothing awaits any more, so a
+    /// started save always finishes its commit or rollback, and retirement waits for it.
+    /// Returns the revision of the bytes written.
+    pub(crate) async fn save_page(
+        &self,
+        id: &str,
+        if_match: &str,
+        body: &str,
+    ) -> Result<String, ApiError> {
+        self.save_page_within(SAVE_START, None, id, if_match, body)
+            .await
+    }
+
+    /// [`Server::save_page`] for an editor whose lifetime can be revoked (`live`, an in-panel
+    /// editor's mount): it is checked again under the writer fence, so a save of an editor
+    /// that was released before the save started never runs. Revoke it, then
+    /// [`Server::drain_writer`], to know no save of that editor is still under way.
+    pub(crate) async fn save_page_while(
+        &self,
+        live: &std::sync::atomic::AtomicBool,
+        id: &str,
+        if_match: &str,
+        body: &str,
+    ) -> Result<String, ApiError> {
+        self.save_page_within(SAVE_START, Some(live), id, if_match, body)
+            .await
+    }
+
+    /// Wait until no writer (a started save, its commit or rollback, or an agent call) holds
+    /// the writer fence any more. Changes nothing.
+    pub(crate) async fn drain_writer(&self) {
+        drop(self.lifecycle.write.lock().await);
+    }
+
+    /// [`Server::save_page`] with its own bound on the wait for the writer fence and an
+    /// optional revocable editor lifetime (see [`Server::save_page_while`]).
+    pub(crate) async fn save_page_within(
+        &self,
+        start_within: std::time::Duration,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        id: &str,
+        if_match: &str,
+        body: &str,
+    ) -> Result<String, ApiError> {
+        if body.len() > MAX_PAGE_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("the page is larger than {MAX_PAGE_BYTES} bytes; nothing was written"),
+            ));
+        }
+        #[cfg(test)]
+        test_support::hit(&self.dir, "browser_queued");
+        let _write = tokio::time::timeout(start_within, self.lifecycle.write.lock())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the save could not start in time (the canvas was busy); it was not run and \
+                     nothing was written",
+                )
+            })?;
+        // Under the fence: admission again (a close may have retired the binding meanwhile),
+        // and the editor's own lifetime (it may have been released meanwhile).
+        self.admit()?;
+        if live.is_some_and(|l| !l.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this editor was left (released) before its save could start; it was not run \
+                 and nothing was written",
+            ));
+        }
+        // Started: from here on it runs to its commit or rollback, and retirement and a
+        // release (`drain_writer`) wait for it.
+        #[cfg(test)]
+        test_support::hit(&self.dir, "save_started");
+        let mut p = self.project()?;
+        let name = page_ref(&p, id)?;
+        // Strict: the save must be based on the revision on disk now (whoever wrote it: the
+        // agent through this server, or anything else). A stale one is refused, unwritten.
+        let current = revision(&read_page(&p, id)?);
+        if if_match != current {
+            return Err(ApiError {
+                etag: Some(current),
+                ..ApiError::new(
+                    StatusCode::CONFLICT,
+                    "the page changed since it was loaded; nothing was written",
+                )
+            });
+        }
+        let mut page = page_from_json(body)
+            .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        if page.id != id {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "page id in the body does not match the URL or page_id",
+            ));
+        }
+        // The manifest owns page names (as in upstream `Project::load_page`).
+        page.name = name.clone();
+        page.doc.name = name;
+        // Checked again just before writing (`read_page` above checked the page file).
+        self.check()?;
+        refuse_if_broken(&self.broken)
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        // Like the native session: a page write bumps the project's modified time. The page
+        // and the manifest are written as one commit: on an error neither changed.
+        p.manifest.modified = now_ms();
+        let writes = [
+            commit::Write {
+                path: p.page_path(&page.id),
+                data: page_to_json(&page).into_bytes(),
+            },
+            commit::Write {
+                path: p.dir.join(MANIFEST),
+                data: p.manifest.to_json().into_bytes(),
+            },
+        ];
+        commit::commit(&writes).map_err(|e| {
+            if let commit::CommitError::Broken { files, .. } = &e {
+                set_broken(&self.broken, &files.join(", "));
+            }
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.describe())
+        })?;
+        // Committed: the revision is the hash of the bytes just written. Nothing that can
+        // fail comes after the commit, so a saved page is never reported as not saved.
+        let rev = etag(&writes[0].data);
+        self.editor
+            .saves
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(rev)
+    }
+
+    /// An editor of this binding (the browser tab or an in-panel editor) reports that it loaded
+    /// its page and its renderer is Ready. Changes no file.
+    pub(crate) fn mark_ready(&self) -> Result<(), ApiError> {
+        self.admit()?;
+        self.editor
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
 /// The manifest's entry for `id`, or an error response. Ids are checked against the
 /// manifest (and for a plain character set), never used as client-chosen paths.
 fn page_ref(p: &Project, id: &str) -> Result<String, ApiError> {
@@ -757,55 +1112,30 @@ fn revision(bytes: &Option<Vec<u8>>) -> String {
 }
 
 async fn get_page(State(s): State<Arc<Server>>, UrlPath(id): UrlPath<String>) -> Response {
-    let result = (|| {
-        let p = s.project()?;
-        let name = page_ref(&p, &id)?;
-        let bytes = read_page(&p, &id)?;
-        let rev = revision(&bytes);
-        let body = match bytes {
-            Some(b) => b,
-            // Same as upstream `Project::load_pages`: a listed page without a file is empty.
-            None => page_to_json(&PageData {
-                id: id.clone(),
-                name: name.clone(),
-                doc: Document {
-                    name: name.clone(),
-                    ..Default::default()
-                },
-                camera: None,
-            })
-            .into_bytes(),
-        };
-        Ok::<_, ApiError>(
-            (
-                [
-                    (header::CONTENT_TYPE, "application/json".to_string()),
-                    (header::ETAG, rev),
-                ],
-                body,
-            )
-                .into_response(),
+    match s.page(Some(&id)) {
+        Ok(page) => (
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (header::ETAG, page.revision),
+            ],
+            page.bytes,
         )
-    })();
-    result.unwrap_or_else(IntoResponse::into_response)
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// The page's current revision only (cheap polling for the browser).
 async fn get_revision(State(s): State<Arc<Server>>, UrlPath(id): UrlPath<String>) -> Response {
-    let result = (|| {
-        let p = s.project()?;
-        page_ref(&p, &id)?;
-        let rev = revision(&read_page(&p, &id)?);
-        Ok::<_, ApiError>(
-            (
-                [(header::ETAG, rev.clone())],
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "revision": rev }).to_string(),
-            )
-                .into_response(),
+    match s.page_revision(&id) {
+        Ok(rev) => (
+            [(header::ETAG, rev.clone())],
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "revision": rev }).to_string(),
         )
-    })();
-    result.unwrap_or_else(IntoResponse::into_response)
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 async fn put_page(
@@ -820,73 +1150,16 @@ async fn put_page(
             "If-Match with the page revision is required",
         );
     };
-    #[cfg(test)]
-    test_support::hit(&s.dir, "browser_queued");
-    let _write = s.lifecycle.write.lock().await;
-    let result = (|| {
-        s.lifecycle
-            .check_active()
-            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        let mut p = s.project()?;
-        let name = page_ref(&p, &id)?;
-        // Strict: the save must be based on the revision on disk now (whoever wrote it: the
-        // agent through this server, or anything else). A stale one is refused, unwritten.
-        let current = revision(&read_page(&p, &id)?);
-        if if_match != current {
-            return Err(ApiError {
-                etag: Some(current),
-                ..ApiError::new(
-                    StatusCode::CONFLICT,
-                    "the page changed since it was loaded; nothing was written",
-                )
-            });
-        }
-        let mut page = page_from_json(&body)
-            .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-        if page.id != id {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "page id in the body does not match the URL",
-            ));
-        }
-        // The manifest owns page names (as in upstream `Project::load_page`).
-        page.name = name.clone();
-        page.doc.name = name;
-        // Checked again just before writing (`read_page` above checked the page file).
-        s.check()?;
-        refuse_if_broken(&s.broken)
-            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        // Like the native session: a page write bumps the project's modified time. The page
-        // and the manifest are written as one commit: on an error neither changed.
-        p.manifest.modified = now_ms();
-        let writes = [
-            commit::Write {
-                path: p.page_path(&page.id),
-                data: paper_rs::project::format::page_to_json(&page).into_bytes(),
-            },
-            commit::Write {
-                path: p.dir.join(MANIFEST),
-                data: p.manifest.to_json().into_bytes(),
-            },
-        ];
-        commit::commit(&writes).map_err(|e| {
-            if let commit::CommitError::Broken { files, .. } = &e {
-                set_broken(&s.broken, &files.join(", "));
-            }
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.describe())
-        })?;
-        // Committed: the revision is the hash of the bytes just written. Nothing that can
-        // fail comes after the commit, so a saved page is never reported as not saved.
-        let rev = etag(&writes[0].data);
-        Ok((
+    match s.save_page(&id, &if_match, &body).await {
+        Ok(rev) => (
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({ "revision": rev }).to_string(),
         )
-            .into_response())
-    })();
-    result.unwrap_or_else(IntoResponse::into_response)
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 #[cfg(test)]

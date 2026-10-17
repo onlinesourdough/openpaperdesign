@@ -644,6 +644,223 @@ async fn bundle_is_served_from_memory_after_its_folder_is_replaced() {
     assert_eq!(send(&s, get("/")).await.2, "<!doctype html>original");
 }
 
+/// The host opens the editor URL as a top-level page from its own site (a link, or a redirect
+/// to the loopback URL): the browser marks that `GET /` as a cross-site or same-site document
+/// navigation, and it gets the static bootstrap page. Nothing else from another site does: the
+/// same navigation into a frame, fetches and subresources, other paths and methods, the API and
+/// MCP (with the token, too), partial or unknown fetch metadata, a foreign Origin or Host. The
+/// page's own later requests are same-origin and work as before. No request changes a file.
+#[tokio::test]
+async fn top_level_navigation_from_another_site_gets_only_the_static_page() {
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let s = open_with_web(&p, bundle_dir(&t, "web", "<!doctype html>editor page")).unwrap();
+    let files = || {
+        (
+            file(&p, &id),
+            std::fs::read(p.dir.join("project.json")).unwrap(),
+        )
+    };
+    let before = files();
+    let fetch = |path: &str, site: &str, mode: &str, dest: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, HOST)
+            .header("sec-fetch-site", site)
+            .header("sec-fetch-mode", mode)
+            .header("sec-fetch-dest", dest)
+    };
+    for (what, r) in [
+        (
+            "cross-site link",
+            fetch("/", "cross-site", "navigate", "document"),
+        ),
+        (
+            "same-site link",
+            fetch("/", "same-site", "navigate", "document"),
+        ),
+        (
+            "cross-site, with the page's query",
+            fetch("/?backend=webgl", "cross-site", "navigate", "document"),
+        ),
+        ("typed URL", fetch("/", "none", "navigate", "document")),
+        (
+            "the page's own script",
+            fetch("/app.js", "same-origin", "no-cors", "script"),
+        ),
+    ] {
+        let res = router(s.clone())
+            .oneshot(r.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{what}");
+        // Admitted, the page keeps every protection: no framing, no caching, no referrer,
+        // and nothing that would let another site read it.
+        let h = res.headers();
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{what}: {csp}");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store", "{what}");
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        assert!(
+            !h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "{what}: no CORS"
+        );
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            body == "<!doctype html>editor page" || body == "// app",
+            "{what}"
+        );
+    }
+    // The page's API calls still need the token, and only the right one.
+    let api = format!("/api/pages/{id}");
+    let bearer = format!("Bearer {TOKEN}");
+    let same_origin = || {
+        Request::builder()
+            .uri(&api)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, "http://127.0.0.1:41234")
+            .header("sec-fetch-site", "same-origin")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
+    };
+    for (what, r, want) in [
+        ("no token", same_origin(), StatusCode::UNAUTHORIZED),
+        (
+            "a wrong token",
+            same_origin().header(header::AUTHORIZATION, "Bearer wrong"),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "the token",
+            same_origin().header(header::AUTHORIZATION, &bearer),
+            StatusCode::OK,
+        ),
+    ] {
+        let (st, _, body) = send(&s, r.body(Body::empty()).unwrap()).await;
+        assert_eq!(st, want, "{what}");
+        assert_eq!(
+            body.as_bytes() == file(&p, &id).as_slice(),
+            want == StatusCode::OK,
+            "{what}: the page only with the token"
+        );
+    }
+    for (what, r) in [
+        (
+            "into a frame",
+            fetch("/", "cross-site", "navigate", "iframe"),
+        ),
+        (
+            "into a legacy frame",
+            fetch("/", "cross-site", "navigate", "frame"),
+        ),
+        (
+            "a CORS fetch of the page",
+            fetch("/", "cross-site", "cors", "empty"),
+        ),
+        (
+            "a no-cors fetch of the page",
+            fetch("/", "same-site", "no-cors", "empty"),
+        ),
+        (
+            "a script from another site",
+            fetch("/app.js", "cross-site", "no-cors", "script"),
+        ),
+        (
+            "a navigation to a bundle file",
+            fetch("/app.js", "cross-site", "navigate", "document"),
+        ),
+        (
+            "a navigation to the wasm",
+            fetch(
+                "/openpaperdesign_web_bg.wasm",
+                "cross-site",
+                "navigate",
+                "document",
+            ),
+        ),
+        (
+            "a HEAD navigation",
+            fetch("/", "cross-site", "navigate", "document").method("HEAD"),
+        ),
+        (
+            "a navigation to the API, with the token",
+            fetch(&api, "cross-site", "navigate", "document")
+                .header(header::AUTHORIZATION, &bearer),
+        ),
+        (
+            "a navigation to MCP, with the token",
+            fetch("/mcp", "cross-site", "navigate", "document")
+                .header(header::AUTHORIZATION, &bearer),
+        ),
+        (
+            "a form POST navigation",
+            fetch("/", "cross-site", "navigate", "document").method("POST"),
+        ),
+        (
+            "no mode",
+            Request::builder()
+                .uri("/")
+                .header(header::HOST, HOST)
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-dest", "document"),
+        ),
+        (
+            "no destination",
+            Request::builder()
+                .uri("/")
+                .header(header::HOST, HOST)
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-mode", "navigate"),
+        ),
+        (
+            "an unknown site value",
+            fetch("/", "elsewhere", "navigate", "document"),
+        ),
+        (
+            "a mode that isn't the browser's",
+            fetch("/", "cross-site", "Navigate", "document"),
+        ),
+        (
+            "a foreign Origin",
+            fetch("/", "cross-site", "navigate", "document")
+                .header(header::ORIGIN, "https://evil.example"),
+        ),
+        (
+            "a null Origin",
+            fetch("/", "cross-site", "navigate", "document").header(header::ORIGIN, "null"),
+        ),
+        (
+            "a foreign Host (DNS rebinding)",
+            Request::builder()
+                .uri("/")
+                .header(header::HOST, "evil.example:41234")
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-dest", "document"),
+        ),
+    ] {
+        let (st, _, body) = send(&s, r.body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}");
+        assert!(
+            !body.contains("editor page") && !body.contains("// app"),
+            "{what}"
+        );
+    }
+    assert_eq!(files(), before, "no file changed");
+    // A retired server serves no page, even to an admitted navigation.
+    s.retire().await;
+    let (st, _, body) = send(
+        &s,
+        fetch("/", "cross-site", "navigate", "document")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!body.contains("editor page"));
+    assert_eq!(files(), before, "no file changed");
+}
+
 /// A bundle folder inside the project would follow the project root if that were replaced;
 /// it is refused at startup, as is the project folder itself.
 #[cfg(unix)]

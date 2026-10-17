@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "openpaperdesign",
   "version": "0.1.0",
-  "description": "Edit a design project in your workspace with an agent and in an editable canvas in the in-app browser (paper-rs, local only).",
+  "description": "Create, open and edit design canvases from the Codex sidebar in an editable canvas in the in-app browser, kept in the app's own local library (paper-rs, local only).",
   "author": { "name": "onlinesourdough", "url": "https://github.com/onlinesourdough" },
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/onlinesourdough/openpaperdesign",
@@ -12,10 +12,14 @@
     "com.openai": {
       "interface": {
         "displayName": "openpaperdesign",
-        "shortDescription": "Agent + human design canvas",
-        "longDescription": "Binds one paper-rs design project in the workspace, lets the agent edit it over MCP, and opens the editable canvas in the in-app browser on a loopback URL. Local only: no cloud, no telemetry. Not affiliated with Paper (paper.design).",
+        "shortDescription": "Editable design canvases",
+        "longDescription": "The OpenPaperDesign home in the sidebar creates, opens, closes, imports and exports paper-rs canvases kept in the plugin's own data folder, and opens each in an editable canvas in the in-app browser on a loopback URL. No chat message or agent turn is needed for that. Workspace projects (design/<name>/) need a separately started openpaperdesign-mcp --codex-context server. Local only: no cloud, no telemetry. Not affiliated with Paper (paper.design).",
         "developerName": "onlinesourdough",
-        "category": "Design"
+        "category": "Design",
+        "logo": "./assets/logo.svg",
+        "logoDark": "./assets/logo-dark.svg",
+        "composerIcon": "./assets/icon.svg",
+        "composerIconDark": "./assets/icon-dark.svg"
       },
       "onboardingSkill": "./skills/setup"
     }

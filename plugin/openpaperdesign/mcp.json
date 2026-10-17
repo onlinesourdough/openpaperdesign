@@ -4,7 +4,7 @@
     "openpaperdesign": {
       "type": "stdio",
       "command": "openpaperdesign-mcp",
-      "args": ["--codex-context"]
+      "args": ["--app-library", "${PLUGIN_DATA}"]
     }
   }
 }

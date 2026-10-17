@@ -34,10 +34,11 @@ jobs:
         run: cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
       # The runner's preinstalled Node (>= 22); no setup-node, no package.json. An explicit
       # file, because Node 22 doesn't take a directory here.
-      - name: Test the page's editor lifecycle (Node, mocked DOM)
+      - name: Test the page's editor lifecycle and the home view (Node, mocked DOM)
         run: |
           node --version
-          node --test crates/openpaperdesign-web/tests/session.test.mjs
+          node crates/openpaperdesign-web/tests/session.test.mjs
+          node crates/openpaperdesign-serve/tests/home.test.mjs
       # The plugin: manifests/skills (Node) and the ported design-method tests (Python 3,
       # standard library only).
       - name: Test the openpaperdesign plugin
@@ -53,3 +54,16 @@ jobs:
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
       - name: Check portable core and web editor for wasm32
         run: cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown
+      # The browser bundle as AGENTS.md documents it (wasm-bindgen CLI pinned to the
+      # wasm-bindgen crate's 0.2.129), then the in-panel editor module test against that actual
+      # generated glue. The test reads the glue from target/openpaperdesign-web and fails
+      # (never skips) without it.
+      - name: wasm-bindgen CLI 0.2.129
+        run: cargo install --locked wasm-bindgen-cli --version 0.2.129
+      - name: Build the browser bundle
+        run: sh scripts/build-web.sh
+      - name: Test the in-panel editor module against the built glue (Node)
+        run: |
+          node --version
+          test -s target/openpaperdesign-web/openpaperdesign_web.js
+          node crates/openpaperdesign-web/tests/panel.test.mjs

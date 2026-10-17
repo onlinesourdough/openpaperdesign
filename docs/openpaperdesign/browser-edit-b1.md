@@ -73,7 +73,12 @@ apart from `manifest.modified`.
   then gets 401.
 - **Request checks:** the server refuses a `Host` other than `127.0.0.1:<port>` /
   `localhost:<port>` (DNS rebinding), an `Origin` other than those, and
-  `Sec-Fetch-Site` values other than `same-origin`/`none`. Every response carries `no-store`,
+  `Sec-Fetch-Site` values other than `same-origin`/`none`, with one exception: a `same-site` or
+  `cross-site` top-level document navigation to the page itself (`GET /` with
+  `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`, as when a host link or redirect
+  opens the editor URL) gets the static bootstrap page, which holds no project data. Frames,
+  fetches, subresources, other paths and methods, the API and MCP stay refused from another
+  site, and the API still needs the token. Every response carries `no-store`,
   `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. That includes
   refusals, unknown paths and body-limit errors, because the headers are added by the
   outermost layer. Only the six bundle files are served (`index.html`, `app.js`,

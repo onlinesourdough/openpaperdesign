@@ -56,3 +56,8 @@ SOFTWARE.
 
 Inter 4.1 by Rasmus Andersson — SIL Open Font License 1.1 (`assets/fonts/OFL.txt`). Regular,
 Medium, SemiBold, Bold, Italic and Bold Italic are bundled unmodified.
+
+Geist Pixel Square by The Geist Project Authors (https://github.com/vercel/geist-font) — SIL
+Open Font License 1.1 (`crates/openpaperdesign-serve/assets/geist-OFL.txt`). Bundled
+unmodified (`crates/openpaperdesign-serve/assets/geist-pixel-square.woff2`) and served only
+inside the plugin's home view, for its `onlinesourdough` wordmark.

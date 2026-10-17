@@ -12,6 +12,8 @@ const FILES: &[&str] = &[
     "app.js",
     "page.js",
     "session.js",
+    "editor.js",
+    "panel.js",
     "openpaperdesign_web.js",
     "openpaperdesign_web_bg.wasm",
 ];

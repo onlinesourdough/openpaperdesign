@@ -11,5 +11,7 @@ wasm-bindgen --target web --no-typescript --out-dir "$out" \
     target/wasm32-unknown-unknown/release/openpaperdesign_web.wasm
 cp crates/openpaperdesign-web/static/index.html crates/openpaperdesign-web/static/app.js \
     crates/openpaperdesign-web/static/session.js \
-    crates/openpaperdesign-web/static/page.js "$out/"
+    crates/openpaperdesign-web/static/page.js \
+    crates/openpaperdesign-web/static/editor.js \
+    crates/openpaperdesign-web/static/panel.js "$out/"
 ls -l "$out"

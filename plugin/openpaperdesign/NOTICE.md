@@ -3,8 +3,10 @@
 openpaperdesign is a fork of [paper-rs](https://github.com/michaelshimeles/paper-rs)
 (MIT OR Apache-2.0); see the repository's `LICENSE-MIT`, `LICENSE-APACHE` and
 `THIRD_PARTY.md`. The browser editor bundles the Inter font (SIL OFL 1.1,
-`assets/fonts/OFL.txt` in the repository). Not affiliated with or endorsed by Paper
-(paper.design).
+`assets/fonts/OFL.txt` in the repository). The home view embeds Geist Pixel Square, unmodified,
+for its `onlinesourdough` wordmark (SIL OFL 1.1, Copyright 2024 The Geist Project Authors;
+`crates/openpaperdesign-serve/assets/geist-OFL.txt` in the repository). Not affiliated with
+or endorsed by Paper (paper.design).
 
 ## Ported design methods
 

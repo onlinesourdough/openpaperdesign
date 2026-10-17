@@ -292,6 +292,8 @@ pub struct BoundHost {
     broken: crate::Broken,
     /// Every page id this host has held (released by `crate::Server::retire`).
     held: crate::HeldPages,
+    /// The app library's identity check, for a library canvas (see `crate::Guard`).
+    guard: Option<crate::Guard>,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
@@ -419,6 +421,18 @@ impl BoundHost {
         broken: crate::Broken,
         held: crate::HeldPages,
     ) -> Result<BoundHost, String> {
+        BoundHost::prepare_guarded(dir, broken, held, None)
+    }
+
+    fn prepare_guarded(
+        dir: &Path,
+        broken: crate::Broken,
+        held: crate::HeldPages,
+        guard: Option<crate::Guard>,
+    ) -> Result<BoundHost, String> {
+        if let Some(g) = &guard {
+            g()?;
+        }
         let mut h = BoundHost {
             ed: Editor::default(),
             project: Project {
@@ -435,6 +449,7 @@ impl BoundHost {
             gpu_tried: false,
             broken,
             held,
+            guard,
         };
         h.load()?;
         Ok(h)
@@ -932,6 +947,9 @@ fn execute_inner(
 ) -> Result<(ToolResult, Option<Ack>), String> {
     let dir = host.project.dir.clone();
     check_root(&dir, root_id)?;
+    if let Some(g) = &host.guard {
+        g()?;
+    }
     check_project_dir(&dir)?;
     host.sync()?;
     let mut args = args.clone();
@@ -1119,12 +1137,26 @@ pub(crate) async fn send_and_wait(
 
 /// Prepare the host thread without resetting layout state. Once activated, calls run one
 /// at a time under the binding's writer fence; a retired binding never executes another job.
+#[allow(dead_code)]
 pub(crate) fn spawn_host(
     dir: PathBuf,
     root_id: (u64, u64),
     lifecycle: Arc<crate::lifecycle::Lifecycle>,
     broken: crate::Broken,
     held: crate::HeldPages,
+) -> Result<Calls, String> {
+    spawn_host_guarded(dir, root_id, lifecycle, broken, held, None)
+}
+
+/// [`spawn_host`] with the app library's guard (see `crate::Guard`), checked before the
+/// project is loaded and before every call.
+pub(crate) fn spawn_host_guarded(
+    dir: PathBuf,
+    root_id: (u64, u64),
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    broken: crate::Broken,
+    held: crate::HeldPages,
+    guard: Option<crate::Guard>,
 ) -> Result<Calls, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Option<Job>>();
     let calls = Calls {
@@ -1137,7 +1169,7 @@ pub(crate) fn spawn_host(
     std::thread::Builder::new()
         .name("opd-mcp-host".into())
         .spawn(move || {
-            let host = BoundHost::prepare(&dir, broken, held);
+            let host = BoundHost::prepare_guarded(&dir, broken, held, guard);
             let mut host = match host {
                 Ok(h) => {
                     let _ = ready_tx.send(Ok(()));
